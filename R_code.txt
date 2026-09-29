@@ -1,0 +1,860 @@
+# =============================================================================
+# Integrative Machine-Learning Framework for HRD Prediction in Ovarian Cancer
+# -----------------------------------------------------------------------------
+# Workflow:
+#   1) Load TCGA expression data and split into training (70%) / test (30%)
+#   2) Identify DEGs using limma on the training set
+#   3) Feature selection: Boruta, followed by LASSO-based stability selection
+#   4) Train six classifiers with 10-fold CV on the training set
+#   5) Select the best-performing model by CV AUC
+#   6) Evaluate the best model on the TCGA test set and the ICGC/AOCS cohort
+#   7) Generate Figures 1-3 as PDF files
+# =============================================================================
+
+
+# =============================================================================
+# 0. Package setup
+# =============================================================================
+
+# Compatibility shim for base R < 4.4.0 (the %||% operator was introduced in 4.4)
+if (!exists("%||%", mode = "function")) {
+  `%||%` <- function(a, b) if (is.null(a)) b else a
+}
+
+# Core packages
+pkgs <- c(
+  "limma", "Boruta", "glmnet", "pROC", "caret", "dplyr", "ggplot2",
+  "xgboost", "randomForest", "kknn", "rpart", "e1071", "MLmetrics"
+)
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+suppressPackageStartupMessages({
+  library(limma); library(Boruta); library(glmnet); library(pROC)
+  library(caret); library(dplyr); library(ggplot2)
+  library(xgboost); library(randomForest); library(kknn); library(rpart)
+  library(e1071); library(MLmetrics)
+})
+
+# Additional packages for figure generation
+pkgs2 <- c("pheatmap", "ggrepel", "gridExtra")
+for (p in pkgs2) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+suppressPackageStartupMessages({
+  library(pheatmap); library(ggrepel); library(gridExtra)
+})
+
+# Working directory and random seeds are fixed for full reproducibility
+setwd("D:/PRJs/prj_OV_HRD/revise")
+set.seed(2026)
+
+
+# =============================================================================
+# 1. Evaluation utilities
+# =============================================================================
+
+# Compute binary-classification metrics from predicted probabilities
+evaluate_model <- function(prob, truth, levels = c("HRP", "HRD")) {
+  truth <- factor(truth, levels = levels)
+
+  # ROC curve and its 95% confidence interval (DeLong method)
+  roc_obj <- pROC::roc(truth, prob,
+                       levels = levels, direction = "<", quiet = TRUE)
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  ci_val  <- as.numeric(pROC::ci.auc(roc_obj, method = "delong"))
+
+  # Optimal threshold determined by the Youden index
+  youden   <- roc_obj$sensitivities + roc_obj$specificities - 1
+  best_thr <- roc_obj$thresholds[which.max(youden)]
+
+  pred_cls <- factor(ifelse(prob > best_thr, "HRD", "HRP"), levels = levels)
+  cm <- caret::confusionMatrix(pred_cls, truth, positive = "HRD")
+
+  list(
+    AUC         = auc_val,
+    CI_lower    = ci_val[1],
+    CI_upper    = ci_val[3],
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Accuracy    = as.numeric(cm$overall["Accuracy"]),
+    F1          = as.numeric(cm$byClass["F1"]),
+    Threshold   = best_thr,
+    ROC         = roc_obj,
+    Confusion   = cm
+  )
+}
+
+# Format a single evaluation result as one summary row
+summary_row <- function(res, dataset, model_name) {
+  data.frame(
+    Dataset     = dataset,
+    Model       = model_name,
+    AUC         = round(res$AUC, 4),
+    CI_95       = paste0("(", round(res$CI_lower, 4),
+                         "-",  round(res$CI_upper, 4), ")"),
+    Sensitivity = round(res$Sensitivity, 4),
+    Specificity = round(res$Specificity, 4),
+    Accuracy    = round(res$Accuracy, 4),
+    F1          = round(res$F1, 4),
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# =============================================================================
+# 2. Load TCGA data and build label vector
+# =============================================================================
+# Expression matrix: rows = genes, columns = samples.
+# The first 134 columns are HRP and the remaining 159 are HRD.
+
+tcga_file <- "D:/PRJs/prj_OV_HRD/OV134-HRP-159-HRD.txt"
+expr_tcga <- as.matrix(read.table(tcga_file, header = TRUE, row.names = 1,
+                                  sep = "\t", check.names = FALSE))
+cat("TCGA expression matrix:", dim(expr_tcga), "\n")
+
+sample_ids <- colnames(expr_tcga)
+group_tcga <- factor(c(rep("HRP", 134), rep("HRD", 159)),
+                     levels = c("HRP", "HRD"))
+names(group_tcga) <- sample_ids
+
+
+# =============================================================================
+# 3. Stratified 70/30 split into training and test sets
+# =============================================================================
+
+set.seed(2026)
+train_index   <- createDataPartition(group_tcga, p = 0.7, list = FALSE)
+train_samples <- sample_ids[train_index]
+test_samples  <- setdiff(sample_ids, train_samples)
+
+expr_train  <- expr_tcga[, train_samples, drop = FALSE]
+expr_test   <- expr_tcga[, test_samples,  drop = FALSE]
+group_train <- group_tcga[train_samples]
+group_test  <- group_tcga[test_samples]
+
+cat("Training set:", ncol(expr_train),
+    " (HRP:", sum(group_train == "HRP"),
+    ", HRD:", sum(group_train == "HRD"), ")\n")
+cat("Test set:    ", ncol(expr_test),
+    " (HRP:", sum(group_test  == "HRP"),
+    ", HRD:", sum(group_test  == "HRD"), ")\n")
+
+
+# =============================================================================
+# 4. Differential expression analysis on the training set (limma)
+# =============================================================================
+
+design <- model.matrix(~ group_train)
+colnames(design) <- c("(Intercept)", "HRDvsHRP")
+
+fit         <- eBayes(lmFit(expr_train, design))
+deg_results <- topTable(fit, coef = "HRDvsHRP",
+                        number = Inf, sort.by = "none")
+
+adj_p_cutoff <- 0.05
+logfc_cutoff <- 1
+
+deg_genes <- rownames(deg_results)[
+  deg_results$adj.P.Val < adj_p_cutoff & abs(deg_results$logFC) > logfc_cutoff
+]
+cat("Number of DEGs:", length(deg_genes), "\n")
+
+write.csv(deg_results,                 "DEGs_train_limma_full.csv")
+write.csv(deg_results[deg_genes, ],    "DEGs_train_limma_filtered.csv")
+
+
+# =============================================================================
+# 5. Boruta feature selection on the training set
+# =============================================================================
+
+set.seed(456)
+X_boruta <- t(expr_train[deg_genes, , drop = FALSE])
+y_boruta <- group_train
+
+boruta_result    <- Boruta(X_boruta, y_boruta, doTrace = 1, maxRuns = 200)
+boruta_important <- getSelectedAttributes(boruta_result, withTentative = FALSE)
+cat("Boruta-confirmed genes:", length(boruta_important), "\n")
+
+selected_genes <- if (length(boruta_important) > 0) boruta_important else deg_genes
+write.csv(data.frame(gene = selected_genes),
+          "Boruta_genes.csv", row.names = FALSE)
+
+
+# =============================================================================
+# 6. LASSO-based stability selection (100 repeats x 10-fold CV)
+# =============================================================================
+
+X_sel        <- t(expr_train[selected_genes, , drop = FALSE])
+X_sel_scaled <- scale(X_sel)
+
+set.seed(789)
+n_rep  <- 100
+nfolds <- 10
+freq   <- setNames(rep(0, length(selected_genes)), selected_genes)
+
+for (i in seq_len(n_rep)) {
+  foldid <- sample(rep(1:nfolds, length.out = nrow(X_sel_scaled)))
+  ok <- all(sapply(1:nfolds, function(k)
+    length(unique(y_boruta[foldid == k])) > 1))
+  if (!ok) next
+
+  cv_fit <- cv.glmnet(X_sel_scaled, y_boruta,
+                      family = "binomial", alpha = 1,
+                      type.measure = "auc",
+                      foldid = foldid, nfolds = nfolds)
+
+  coef_min <- coef(cv_fit, s = "lambda.min")[-1, , drop = FALSE]
+  sel      <- rownames(coef_min)[coef_min[, 1] != 0]
+  freq[sel] <- freq[sel] + 1
+}
+
+freq_df <- data.frame(gene = names(freq),
+                      freq = freq,
+                      prop = freq / n_rep) %>%
+  arrange(desc(prop))
+write.csv(freq_df, "stability_selection_frequencies.csv", row.names = FALSE)
+
+threshold    <- 0.7
+stable_genes <- freq_df$gene[freq_df$prop >= threshold]
+if (length(stable_genes) < 3) {
+  warning("Too few stable genes; selecting top-10 by frequency instead.")
+  stable_genes <- freq_df$gene[1:min(10, nrow(freq_df))]
+}
+cat("Final stable gene set (n =", length(stable_genes), ")\n")
+write.csv(data.frame(gene = stable_genes),
+          "stable_genes_selected.csv", row.names = FALSE)
+
+# One additional LASSO run on the full training set for the trajectory plot
+set.seed(789)
+cv_lasso_final <- cv.glmnet(X_sel_scaled, y_boruta,
+                            family = "binomial", alpha = 1,
+                            nfolds = 10, type.measure = "deviance")
+
+
+# =============================================================================
+# 7. Build the final modeling matrices (sample x gene)
+# =============================================================================
+
+# Training set
+X_fin_train_raw <- t(expr_train[stable_genes, , drop = FALSE])
+colnames(X_fin_train_raw) <- stable_genes
+
+# Test set
+X_fin_test_raw <- t(expr_test[stable_genes, , drop = FALSE])
+colnames(X_fin_test_raw) <- stable_genes
+
+# Standardization using training-set mean/SD (applied identically to test)
+train_mean <- apply(X_fin_train_raw, 2, mean)
+train_sd   <- apply(X_fin_train_raw, 2, sd)
+train_sd[train_sd == 0] <- 1
+
+X_fin_train <- as.data.frame(
+  sweep(sweep(X_fin_train_raw, 2, train_mean, "-"), 2, train_sd, "/"))
+X_fin_test  <- as.data.frame(
+  sweep(sweep(X_fin_test_raw,  2, train_mean, "-"), 2, train_sd, "/"))
+
+# Attach class labels
+X_fin_train$Class <- group_train
+X_fin_test$Class  <- group_test
+
+
+# =============================================================================
+# 8. Train six classifiers with 10-fold cross-validation
+# =============================================================================
+
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  allowParallel   = FALSE,
+  verboseIter     = FALSE
+)
+
+methods <- list(
+  XGBoost = "xgbTree",
+  NNET    = "nnet",
+  RF      = "rf",
+  KKNN    = "kknn",
+  DT      = "rpart",
+  NB      = "nb"
+)
+
+model_list <- list()
+cv_results <- list()
+
+for (m in names(methods)) {
+  cat("\n>>> Training model:", m, "...\n")
+  set.seed(2024)
+  fit_m <- tryCatch({
+    caret::train(Class ~ ., data = X_fin_train,
+                 method     = methods[[m]],
+                 trControl  = ctrl,
+                 metric     = "ROC",
+                 tuneLength = 5,
+                 preProcess = NULL)
+  }, error = function(e) {
+    cat("Model", m, "failed:", conditionMessage(e), "\n"); NULL
+  })
+  if (is.null(fit_m)) next
+
+  model_list[[m]] <- fit_m
+
+  cv_res <- evaluate_model(prob = fit_m$pred$HRD, truth = fit_m$pred$obs)
+  cv_results[[m]] <- cv_res
+  cat(sprintf("  CV AUC = %.4f\n", cv_res$AUC))
+}
+
+
+# =============================================================================
+# 9. Select the best model by cross-validated AUC
+# =============================================================================
+
+cv_auc_df <- data.frame(
+  Model  = names(cv_results),
+  CV_AUC = sapply(cv_results, function(x) x$AUC)
+) %>% arrange(desc(CV_AUC))
+
+print(cv_auc_df)
+
+best_method <- cv_auc_df$Model[1]
+best_model  <- model_list[[best_method]]
+cat(sprintf("\n>>> Best model: %s (CV AUC = %.4f)\n",
+            best_method, cv_auc_df$CV_AUC[1]))
+
+
+# =============================================================================
+# 10. Evaluate the best model on the TCGA test set
+# =============================================================================
+
+prob_test <- predict(best_model, newdata = X_fin_test, type = "prob")[, "HRD"]
+res_test  <- evaluate_model(prob_test, group_test)
+
+
+# =============================================================================
+# 11. External validation on the AOCS cohort
+# =============================================================================
+# Expression matrix: rows = genes, columns = samples (log2 scale)
+# Metadata file: first column = sample ID, additional column "HRD.group"
+
+aocs_file      <- "D:/PRJs/prj_OV_HRD/ICGC/GELL_ALL_UNIQ.txt"
+aocs_meta_file <- "D:/PRJs/prj_OV_HRD/ICGC/group.txt"
+
+res_aocs <- NULL
+if (file.exists(aocs_file) && file.exists(aocs_meta_file)) {
+
+  # --- Load expression and metadata (header = TRUE is critical) ---
+  expr_aocs <- as.matrix(read.table(aocs_file, header = TRUE, row.names = 1,
+                                    sep = "\t", check.names = FALSE))
+  meta_aocs <- read.table(aocs_meta_file, row.names = 1, header = TRUE)
+
+  cat("AOCS expression matrix:", dim(expr_aocs), "\n")
+  cat("AOCS metadata columns:  ",
+      paste(colnames(meta_aocs), collapse = ", "), "\n")
+
+  # --- Match samples ---
+  common_samples <- intersect(colnames(expr_aocs), rownames(meta_aocs))
+  stopifnot(length(common_samples) > 0)
+  expr_aocs <- expr_aocs[, common_samples, drop = FALSE]
+  meta_aocs <- meta_aocs[common_samples, , drop = FALSE]
+
+  # --- Extract labels ----
+  if (!"HRD.group" %in% colnames(meta_aocs)) {
+    stop("Column 'HRD.group' not found in AOCS metadata.")
+  }
+  group_aocs <- factor(meta_aocs$HRD.group, levels = c("HRP", "HRD"))
+  cat("AOCS label distribution:\n"); print(table(group_aocs))
+
+  # --- Restrict to the stable genes retained in the model ---
+  genes_avail <- intersect(stable_genes, rownames(expr_aocs))
+  missing_g   <- setdiff(stable_genes, genes_avail)
+  if (length(missing_g) > 0) {
+    warning("Genes missing from AOCS: ", paste(missing_g, collapse = ", "))
+  }
+
+  # --- Standardize using the training-set mean and SD ---
+  X_aocs_raw <- t(expr_aocs[genes_avail, , drop = FALSE])
+  colnames(X_aocs_raw) <- genes_avail
+  X_aocs <- as.data.frame(
+    sweep(sweep(X_aocs_raw, 2, train_mean[genes_avail], "-"),
+          2, train_sd[genes_avail], "/"))
+
+  # Missing genes are imputed with 0 (which equals the training mean)
+  for (g in stable_genes) {
+    if (!g %in% colnames(X_aocs)) X_aocs[[g]] <- 0
+  }
+  X_aocs <- X_aocs[, stable_genes, drop = FALSE]
+
+  stopifnot(nrow(X_aocs) == length(group_aocs))
+  X_aocs$Class <- group_aocs
+
+  # --- Predict and evaluate ---
+  prob_aocs <- predict(best_model, newdata = X_aocs, type = "prob")[, "HRD"]
+  res_aocs  <- evaluate_model(prob_aocs, group_aocs)
+
+  cat("\nAOCS standardized mean per gene (should be near 0):\n")
+  print(round(colMeans(X_aocs[, stable_genes, drop = FALSE]), 3))
+
+} else {
+  cat("AOCS files not found; skipping external validation.\n")
+}
+
+
+# =============================================================================
+# 12. Summarize all performance metrics
+# =============================================================================
+
+cv_table <- do.call(rbind, lapply(names(cv_results), function(m)
+  summary_row(cv_results[[m]], "Train_CV", m)))
+
+test_table <- summary_row(res_test, "TCGA_test", best_method)
+
+final_table <- rbind(
+  cv_table,
+  test_table,
+  if (!is.null(res_aocs)) summary_row(res_aocs, "AOCS", best_method)
+)
+
+print(final_table)
+write.csv(final_table, "final_model_performance.csv", row.names = FALSE)
+
+
+# =============================================================================
+# 13. Figure 1: Training-set DEG volcano plot + heatmap
+# =============================================================================
+
+# --- Panel A. Volcano plot ---
+deg_df     <- as.data.frame(deg_results)
+deg_df$gene <- rownames(deg_df)
+deg_df$change <- "NOT"
+deg_df$change[deg_df$adj.P.Val < adj_p_cutoff & deg_df$logFC >  logfc_cutoff] <- "UP"
+deg_df$change[deg_df$adj.P.Val < adj_p_cutoff & deg_df$logFC < -logfc_cutoff] <- "DOWN"
+deg_df$change <- factor(deg_df$change, levels = c("DOWN", "NOT", "UP"))
+
+# Annotate the top 15 most significant DEGs
+label_df <- deg_df[deg_df$change != "NOT", ]
+label_df <- head(label_df[order(label_df$adj.P.Val), , drop = FALSE], 15)
+
+p_vol <- ggplot(deg_df, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = change), size = 0.7, alpha = 0.7) +
+  scale_color_manual(values = c("DOWN" = "#377EB8",
+                                "NOT"  = "grey70",
+                                "UP"   = "#E41A1C")) +
+  geom_hline(yintercept = -log10(adj_p_cutoff),
+             linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_vline(xintercept = c(-logfc_cutoff, logfc_cutoff),
+             linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_text_repel(data = label_df, aes(label = gene),
+                  size = 2.4, max.overlaps = 30, box.padding = 0.25) +
+  labs(x = "log2 fold change",
+       y = "-log10 (adjusted P-value)",
+       color = "Change", title = "A") +
+  theme_bw(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold", hjust = -0.05),
+        panel.grid.minor = element_blank(),
+        legend.position  = c(0.98, 0.98),
+        legend.justification = c(1, 1),
+        legend.background = element_rect(fill = "white", color = "grey80"))
+
+# --- Panel B. Heatmap of the top-50 DEGs (row-wise z-score) ---
+top_n    <- 50
+top_degs <- head(deg_genes[order(deg_results[deg_genes, "adj.P.Val"])], top_n)
+
+mat_heat <- expr_train[top_degs, , drop = FALSE]
+mat_z    <- t(scale(t(mat_heat)))
+ord      <- order(group_train)
+
+ann_col <- data.frame(Group = group_train[ord])
+rownames(ann_col) <- colnames(mat_z[, ord, drop = FALSE])
+
+p_heat <- pheatmap(
+  mat_z[, ord, drop = FALSE],
+  annotation_col    = ann_col,
+  annotation_colors = list(Group = c(HRP = "#1B9E77", HRD = "#D95F02")),
+  cluster_cols      = FALSE,
+  cluster_rows      = TRUE,
+  show_colnames     = FALSE,
+  show_rownames     = TRUE,
+  fontsize_row      = 6.5,
+  fontsize_col      = 6,
+  color             = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main              = "B",
+  silent            = TRUE
+)
+
+pdf("Figure1_Train_DEG_Volcano_Heatmap.pdf", width = 15, height = 7.5)
+grid.arrange(ggplotGrob(p_vol), p_heat$gtable, ncol = 2, widths = c(1, 1))
+dev.off()
+
+
+# =============================================================================
+# 14. Figure 2: Boruta variable-importance plot + LASSO trajectory
+# =============================================================================
+
+pdf("Figure2_Boruta_LASSO.pdf", width = 14, height = 6.5)
+par(mfrow = c(1, 2))
+
+# --- Panel A. Boruta ---
+par(mar = c(9, 4.5, 3, 1))
+plot(boruta_result,
+     main = "A", xlab = "", ylab = "Importance",
+     cex.axis = 0.45, las = 2, cex.lab = 1.0)
+
+# --- Panel B. LASSO (log binomial deviance vs log(lambda)) ---
+par(mar = c(4.5, 4.5, 3, 1))
+plot(cv_lasso_final, main = "B")
+
+dev.off()
+
+
+# =============================================================================
+# 15. Figure 3: ROC curves across the three evaluation settings
+#        Panel A: six classifiers under 10-fold CV on the training set
+#        Panels B, C: only the best model (NB) on TCGA test and AOCS
+# =============================================================================
+
+# Consistent color palette for Panel A
+model_colors <- c(
+  XGBoost = "#E41A1C",
+  NNET    = "#377EB8",
+  RF      = "#4DAF4A",
+  KKNN    = "#984EA3",
+  DT      = "#FF7F00",
+  NB      = "#A65628"
+)
+
+# Helper: extract the CV out-of-fold ROC at the best hyperparameters
+get_cv_roc <- function(fit) {
+  pred <- fit$pred
+  bt   <- fit$bestTune
+  if (!is.null(bt) && ncol(bt) > 0) {
+    keep <- rep(TRUE, nrow(pred))
+    for (col in colnames(bt)) keep <- keep & (pred[[col]] == bt[[col]])
+    pred <- pred[keep, ]
+  }
+  pROC::roc(pred$obs, pred$HRD, levels = c("HRP", "HRD"),
+            direction = "<", quiet = TRUE)
+}
+
+# ---- Panel A. 10-fold CV for all six models ----
+roc_train_list <- lapply(model_list, get_cv_roc)
+
+# ---- Panel B. TCGA test set, best model only ----
+roc_test_best <- pROC::roc(group_test, prob_test,
+                           levels = c("HRP", "HRD"),
+                           direction = "<", quiet = TRUE)
+
+# ---- Panel C. AOCS cohort, best model only ----
+roc_aocs_best <- NULL
+if (!is.null(res_aocs)) {
+  X_aocs_pred    <- X_aocs[, stable_genes, drop = FALSE]
+  prob_aocs_best <- predict(best_model, newdata = X_aocs_pred,
+                            type = "prob")[, "HRD"]
+  roc_aocs_best  <- pROC::roc(group_aocs, prob_aocs_best,
+                              levels = c("HRP", "HRD"),
+                              direction = "<", quiet = TRUE)
+}
+
+# Plotting functions
+plot_multi_roc <- function(roc_list, title, cex_leg = 0.85) {
+  ms   <- names(roc_list)
+  cols <- model_colors[ms]
+  plot(roc_list[[1]], col = cols[1], lwd = 2, legacy.axes = TRUE,
+       main = title, cex.main = 1.3, font.main = 2)
+  if (length(roc_list) > 1) {
+    for (i in 2:length(roc_list))
+      plot(roc_list[[i]], col = cols[i], lwd = 2, add = TRUE)
+  }
+  abline(a = 0, b = 1, lty = 3, col = "grey60")
+  labs <- sprintf("%s (AUC=%.3f)", ms,
+                  sapply(roc_list, function(x) as.numeric(pROC::auc(x))))
+  legend("bottomright", legend = labs, col = cols, lwd = 2,
+         cex = cex_leg, bty = "n")
+}
+
+plot_single_roc <- function(roc_obj, title, col = "#A65628",
+                            label = NULL, cex_leg = 1.0) {
+  plot(roc_obj, col = col, lwd = 2.2, legacy.axes = TRUE,
+       main = title, cex.main = 1.3, font.main = 2)
+  abline(a = 0, b = 1, lty = 3, col = "grey60")
+  if (is.null(label))
+    label <- sprintf("AUC = %.3f", as.numeric(pROC::auc(roc_obj)))
+  legend("bottomright", legend = label, col = col, lwd = 2,
+         cex = cex_leg, bty = "n")
+}
+
+# Assemble the multi-panel figure
+pdf("Figure3_ROC_all_sets.pdf", width = 16, height = 5.5)
+par(mfrow = c(1, 3), mar = c(4.5, 4.5, 3, 1))
+
+plot_multi_roc(roc_train_list, "A  Train (10-fold CV)")
+
+plot_single_roc(
+  roc_test_best, "B  TCGA Test",
+  col   = "#A65628",
+  label = sprintf("%s: AUC = %.3f", best_method,
+                  as.numeric(pROC::auc(roc_test_best)))
+)
+
+if (!is.null(roc_aocs_best)) {
+  plot_single_roc(
+    roc_aocs_best, "C  ICGC/AOCS",
+    col   = "#A65628",
+    label = sprintf("%s: AUC = %.3f", best_method,
+                    as.numeric(pROC::auc(roc_aocs_best)))
+  )
+} else {
+  plot.new(); title(main = "C  ICGC/AOCS (no data)")
+}
+
+dev.off()
+
+
+# =============================================================================
+# 16. Save the final model and reproducibility artifacts
+# =============================================================================
+
+saveRDS(best_model, "best_model.rds")
+saveRDS(list(stable_genes   = stable_genes,
+             train_mean     = train_mean,
+             train_sd       = train_sd,
+             train_samples  = train_samples,
+             test_samples   = test_samples,
+             best_method    = best_method),
+        "model_metadata.rds")
+
+cat("\nAnalysis complete. Generated outputs:\n",
+    "  - DEGs_train_limma_full.csv\n",
+    "  - DEGs_train_limma_filtered.csv\n",
+    "  - Boruta_genes.csv\n",
+    "  - stability_selection_frequencies.csv\n",
+    "  - stable_genes_selected.csv\n",
+    "  - final_model_performance.csv\n",
+    "  - Figure1_Train_DEG_Volcano_Heatmap.pdf\n",
+    "  - Figure2_Boruta_LASSO.pdf\n",
+    "  - Figure3_ROC_all_sets.pdf\n",
+    "  - best_model.rds\n",
+    "  - model_metadata.rds\n")
+	
+	
+# =============================================================================
+# 17. External published 217-gene HRD signature: head-to-head validation
+#     Rationale: reproduce the external signature within the same analytic
+#     framework as our ML pipeline (same training set, same model family,
+#     same standardization, same evaluation metrics) for a fair comparison.
+# =============================================================================
+
+# ---- 17.1 The published 217-gene list --------------------------------------
+signature_217 <- c(
+  "AC093001.1","MUCL1","ROCR","HMGCS2","CYP4Z2P","CLCA2","SOX10","CT83",
+  "LINC01152","HORMAD1","CYP4Z1","ROPN1B","SPINK8","TFAP2B","TDRD1","ADH1C",
+  "ROPN1","PRSS33","GABRP","SDR16C5","CEACAM5","DLX6","CPHL1P","TSPAN8",
+  "FOXA1","LEMD1","LINC02188","CCL21","LINC02487","FREM2","SLC6A15",
+  "LINC00993","LINC01956","IYD","CEACAM7","ENSG00000240800","ABCC12","MIA",
+  "LINC01198","CYP4F8","KLHDC7A","TMC5","ANKRD30A","ABCA12","OCA2","LRRC31",
+  "TFF3","HGD","AC096996.2","REEP6","ZIC1","AR","AGR2","TTC6","LRG1","SLC44A4",
+  "AC020907.1","SMIM31","C7","TPSB2","UGT8","FCN2","CNTNAP2","SPDEF","TMEM213",
+  "ZBTB8B","COL9A1","ENSG00000254967","ELF5","CAPN13","OXGR1","SHC4","DLX6-AS1",
+  "SIDT1","PRAME","SOX9-AS1","ZBTB16","LINC01224","CPA3","AC008268.1","TPSAB1",
+  "TTYH1","SPHKAP","KIRREL3-AS1","CCKBR","C9orf152","AC024940.2","RLBP1",
+  "FAM19A3","CA6","AP001783.1","AARD","FABP4","PLA2G2A","BCAS1","LRFN2","EPGN",
+  "SLCO4A1-AS1","PRR15","ART3","PLEKHG7","CTSG","AC005077.4","LINC02015",
+  "POU4F1","HDC","AL157387.1","AC011247.1","OGN","GABBR2","MUC16","ST6GALNAC1",
+  "RASGEF1C","SOX8","AC015712.4","NDUFB4P11","CRABP1","SEC14L4","MS4A2",
+  "SLC27A6","S100A1","TPSD1","KNDC1","SCRG1","MLPH","SELP","NCMAP","CHRM3",
+  "AL022334.1","PCDH8","FCER2","ZIC4","EN1","TFCP2L1","SFRP1","MMRN1","ABCA8",
+  "TCAM1P","VGLL1","PTX3","CST2","DLGAP1","AC022101.1","DSC3","PLEKHB1",
+  "TMPRSS5","SYTL5","ENSG00000232224","PLS3-AS1","PLA2G4F","CRHR1","MAPK4",
+  "CYP4B1","GFRA3","OR7E22P","EPHA7","ABCC8","KRT9","AC245884.9","BLK","NRTN",
+  "GTF2IP7","OPRK1","SLC7A2","C8orf46","SCUBE2","AC021683.2","LINC00862","SOX6",
+  "FBN3","KYNU","TMEM45B","AC098936.1","CMTM5","OR2B6","C4B","LINC00160",
+  "ATP1A2","AC022148.1","MFAP4","KRT83","CILP","LINC00518","LILRA4","LAMP5",
+  "LINC01122","CNR2","AC069148.1","DRAIC","CD19","FOXD3","KCNK5","IMPDH1P8",
+  "SFRP4","NRK","HRASLS2","EXTL1","CD177","SERPINB5","GFRA1","CXCL14",
+  "LINC00504","CYP4F22","MSX2","RPSAP69","LINC00839","WNK3","SCN2B","FOXD3-AS1",
+  "TSPAN1","LINC00092","CMA1","KERA","C9orf170","ENSG00000253701","C1QL4","SVOPL"
+)
+stopifnot(length(signature_217) == 217)
+cat("Published signature loaded:", length(signature_217), "genes\n")
+
+
+# ---- 17.2 Which signature genes are available in the TCGA data? -----------
+sig_in_tcga  <- intersect(signature_217, rownames(expr_tcga))
+sig_missing  <- setdiff(signature_217, rownames(expr_tcga))
+cat("Signature genes present in TCGA:",
+    length(sig_in_tcga), "/", length(signature_217), "\n")
+if (length(sig_missing) > 0) {
+  cat("Missing in TCGA (n =", length(sig_missing), "):\n  ",
+      paste(sig_missing, collapse = ", "), "\n")
+}
+
+
+# ---- 17.3 Build feature matrices (standardization identical to our model) --
+# Training set
+X_sig_train_raw <- t(expr_train[sig_in_tcga, , drop = FALSE])
+colnames(X_sig_train_raw) <- sig_in_tcga
+
+# Test set
+X_sig_test_raw <- t(expr_test[sig_in_tcga, , drop = FALSE])
+colnames(X_sig_test_raw) <- sig_in_tcga
+
+# Standardize using TRAINING-set mean and SD (same policy as our main model)
+sig_mean <- apply(X_sig_train_raw, 2, mean)
+sig_sd   <- apply(X_sig_train_raw, 2, sd)
+sig_sd[sig_sd == 0] <- 1
+
+X_sig_train <- as.data.frame(
+  sweep(sweep(X_sig_train_raw, 2, sig_mean, "-"), 2, sig_sd, "/"))
+X_sig_test <- as.data.frame(
+  sweep(sweep(X_sig_test_raw, 2, sig_mean, "-"), 2, sig_sd, "/"))
+
+X_sig_train$Class <- group_train
+X_sig_test$Class  <- group_test
+
+
+# ---- 17.4 Fit the SAME model family as our best model (fair framework) -----
+# Using the identical model class as `best_model` ensures the ONLY difference
+# under test is the feature set (our stable genes vs. the published 217 genes).
+set.seed(2024)
+
+sig_ctrl <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  allowParallel   = FALSE,
+  verboseIter     = FALSE
+)
+
+sig_model <- caret::train(
+  Class ~ .,
+  data       = X_sig_train,
+  method     = methods[[best_method]],   # = "nb"
+  trControl  = sig_ctrl,
+  metric     = "ROC",
+  tuneLength = 5,
+  preProcess = NULL
+)
+
+cat(sprintf("\nExternal signature model trained (method = %s).\n",
+            best_method))
+
+
+# ---- 17.5 Cross-validated performance on the training set -----------------
+cv_sig <- evaluate_model(prob = sig_model$pred$HRD,
+                         truth = sig_model$pred$obs)
+cat(sprintf("[Signature-217]  Train  10-fold CV AUC = %.4f\n", cv_sig$AUC))
+
+
+# ---- 17.6 TCGA test set ---------------------------------------------------
+prob_sig_test <- predict(sig_model, newdata = X_sig_test, type = "prob")[, "HRD"]
+res_sig_test  <- evaluate_model(prob_sig_test, group_test)
+cat(sprintf("[Signature-217]  TCGA test AUC = %.4f\n", res_sig_test$AUC))
+
+
+# ---- 17.7 External validation on ICGC/AOCS --------------------------------
+res_sig_aocs <- NULL
+if (exists("expr_aocs") && exists("group_aocs") && !is.null(res_aocs)) {
+
+  sig_in_aocs   <- intersect(sig_in_tcga, rownames(expr_aocs))
+  sig_miss_aocs <- setdiff(sig_in_tcga,     rownames(expr_aocs))
+  cat("\nSignature genes present in AOCS:",
+      length(sig_in_aocs), "/", length(sig_in_tcga), "\n")
+  if (length(sig_miss_aocs) > 0) {
+    cat("Missing in AOCS (n =", length(sig_miss_aocs), "):\n  ",
+        paste(sig_miss_aocs, collapse = ", "), "\n")
+  }
+
+  X_sig_aocs_raw <- t(expr_aocs[sig_in_aocs, , drop = FALSE])
+  colnames(X_sig_aocs_raw) <- sig_in_aocs
+  X_sig_aocs <- as.data.frame(
+    sweep(sweep(X_sig_aocs_raw, 2, sig_mean[sig_in_aocs], "-"),
+          2, sig_sd[sig_in_aocs], "/"))
+
+  # Pad missing genes with 0 (equals training mean after standardization)
+  for (g in sig_in_tcga) if (!g %in% colnames(X_sig_aocs)) X_sig_aocs[[g]] <- 0
+  X_sig_aocs <- X_sig_aocs[, sig_in_tcga, drop = FALSE]
+
+  prob_sig_aocs <- predict(sig_model, newdata = X_sig_aocs,
+                           type = "prob")[, "HRD"]
+  res_sig_aocs  <- evaluate_model(prob_sig_aocs, group_aocs)
+  cat(sprintf("[Signature-217]  AOCS AUC = %.4f\n", res_sig_aocs$AUC))
+} else {
+  cat("AOCS data unavailable -- skipping external signature validation.\n")
+}
+
+
+# ---- 17.8 Build the head-to-head summary table ----------------------------
+sig_summary <- rbind(
+  summary_row(cv_sig,        "Train_CV",  paste0("Signature_217 (", best_method, ")")),
+  summary_row(res_sig_test,  "TCGA_test", paste0("Signature_217 (", best_method, ")")),
+  if (!is.null(res_sig_aocs))
+    summary_row(res_sig_aocs, "AOCS", paste0("Signature_217 (", best_method, ")"))
+)
+
+# Add a "Signautre source" column so the CSV is self-describing
+final_table$Source <- "This study"
+sig_summary$Source <- "Published signature"
+
+comparison_table <- rbind(final_table, sig_summary)
+print(comparison_table)
+write.csv(comparison_table,
+          "signature_comparison.csv", row.names = FALSE)
+
+# Also write a compact version focusing only on the head-to-head results
+head2head <- comparison_table[comparison_table$Dataset != "Train_CV" |
+                              comparison_table$Source == "Published signature", ]
+write.csv(head2head,
+          "signature_head_to_head.csv", row.names = FALSE)
+
+
+# ---- 17.9 Figure S1: head-to-head ROC (our model vs published signature) --
+pdf("FigureS1_Signature_Comparison.pdf", width = 15, height = 5.5)
+par(mfrow = c(1, 3), mar = c(4.5, 4.5, 3, 1))
+
+# -- Panel A. Train CV --
+roc_sig_train <- get_cv_roc(sig_model)
+
+plot(roc_sig_train, col = "#7570B3", lwd = 2.2, legacy.axes = TRUE,
+     main = "A  Train (10-fold CV)", cex.main = 1.3, font.main = 2)
+plot(cv_results[[best_method]]$ROC,
+     col = "#A65628", lwd = 2.2, add = TRUE)
+abline(a = 0, b = 1, lty = 3, col = "grey60")
+legend("bottomright",
+       legend = c(sprintf("This study (NB): AUC = %.3f",
+                          cv_results[[best_method]]$AUC),
+                  sprintf("Published 217-gene: AUC = %.3f", cv_sig$AUC)),
+       col = c("#A65628", "#7570B3"), lwd = 2.2,
+       cex = 0.85, bty = "n")
+
+# -- Panel B. TCGA test --
+plot(res_sig_test$ROC, col = "#7570B3", lwd = 2.2, legacy.axes = TRUE,
+     main = "B  TCGA Test", cex.main = 1.3, font.main = 2)
+plot(res_test$ROC, col = "#A65628", lwd = 2.2, add = TRUE)
+abline(a = 0, b = 1, lty = 3, col = "grey60")
+legend("bottomright",
+       legend = c(sprintf("This study (NB): AUC = %.3f", res_test$AUC),
+                  sprintf("Published 217-gene: AUC = %.3f", res_sig_test$AUC)),
+       col = c("#A65628", "#7570B3"), lwd = 2.2,
+       cex = 0.85, bty = "n")
+
+# -- Panel C. AOCS --
+if (!is.null(res_sig_aocs) && !is.null(res_aocs)) {
+  plot(res_sig_aocs$ROC, col = "#7570B3", lwd = 2.2, legacy.axes = TRUE,
+       main = "C  ICGC/AOCS", cex.main = 1.3, font.main = 2)
+  plot(res_aocs$ROC, col = "#A65628", lwd = 2.2, add = TRUE)
+  abline(a = 0, b = 1, lty = 3, col = "grey60")
+  legend("bottomright",
+         legend = c(sprintf("This study (NB): AUC = %.3f", res_aocs$AUC),
+                    sprintf("Published 217-gene: AUC = %.3f", res_sig_aocs$AUC)),
+         col = c("#A65628", "#7570B3"), lwd = 2.2,
+         cex = 0.85, bty = "n")
+} else {
+  plot.new(); title(main = "C  ICGC/AOCS (no data)")
+}
+
+dev.off()
+
+cat("\nSection 17 finished. Outputs:\n",
+    "  - signature_comparison.csv\n",
+    "  - signature_head_to_head.csv\n",
+    "  - FigureS1_Signature_Comparison.pdf\n")
